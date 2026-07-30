@@ -10,7 +10,7 @@ A lightweight Tampermonkey userscript that adds ratings, genres, and filters to
 - Direct links to KP and IMDb title pages
 - Up to three IMDb genres per movie
 - Minimum KP and IMDb rating filters
-- Exact Bechdel score filter
+- Minimum Bechdel score filter
 - Multi-select genre exclusion filter
 - Wider, non-wrapping movie list on desktop
 - Lazy loading, batching, and seven-day caching
@@ -33,7 +33,7 @@ new releases without manual replacement.
 | --- | --- |
 | `KP ≥` | Minimum KP rating |
 | `IMDb ≥` | Minimum IMDb rating |
-| `B =` | Exact Bechdel score |
+| `B ≥` | Minimum Bechdel score |
 | `Genre −` | Click genres to mark them with `×` and exclude them |
 
 Filter settings persist across pages.

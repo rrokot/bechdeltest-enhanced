@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.1
+// @version      1.0.2
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -346,7 +346,10 @@
 
   const rowMatchesFilters = (row, filters) => {
     const data = getRowData(row);
-    if (filters.bechdel && data.bechdelRating !== filters.bechdel) return false;
+    if (
+      filters.bechdel
+      && Number(data.bechdelRating) < Number(filters.bechdel)
+    ) return false;
     if (!passesRatingFilter(data.kpBadge, data.kpRating, filters.kpMin)) {
       return false;
     }
@@ -412,10 +415,9 @@
     ];
     const bechdelOptions = [
       ['', '-'],
-      ['3', '3'],
-      ['2', '2'],
       ['1', '1'],
-      ['0', '0'],
+      ['2', '2'],
+      ['3', '3'],
     ];
 
     const panel = document.createElement('div');
@@ -439,7 +441,7 @@
 
     addLabeledControl('KP ≥', kpMin);
     addLabeledControl('IMDb ≥', imdbMin);
-    addLabeledControl('B =', bechdel);
+    addLabeledControl('B ≥', bechdel);
     panel.append(genreDetails);
 
     const excludedGenres = new Set(
