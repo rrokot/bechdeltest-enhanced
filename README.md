@@ -54,9 +54,10 @@ worker pool. Successful results are cached for seven days, while missing results
 are cached for one day.
 
 When Wikidata has no Kinopoisk ID, the userscript performs a sequential
-Kinopoisk search using the IMDb title and year. A result is accepted only when
-its normalized title, year, and director all match the IMDb metadata exactly.
-Blocked, missing, or ambiguous search results remain unresolved.
+Kinopoisk search using the IMDb title and year. If there is no exact match, it
+retries without the year and allows a one-year catalog difference. A result is
+accepted only when its normalized title and director match the IMDb metadata
+exactly. Blocked, missing, or ambiguous search results remain unresolved.
 
 ## License
 

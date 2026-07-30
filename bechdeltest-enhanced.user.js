@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.9
+// @version      1.0.10
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -46,6 +46,8 @@
     kinopoiskConcurrency: 10,
     kinopoiskSearchConcurrency: 1,
     kinopoiskCandidateLimit: 3,
+    kinopoiskYearTolerance: 1,
+    kinopoiskMatchVersion: 2,
     requestTimeout: 20_000,
     genreLimit: 3,
     ratingPrecision: 1,
@@ -911,8 +913,15 @@
     }).filter(({ kinopoiskId }) => kinopoiskId);
   };
 
-  const matchesKinopoiskCandidate = (candidate, movie) => {
-    if (!Number.isInteger(candidate.year) || candidate.year !== movie.year) {
+  const matchesKinopoiskCandidate = (
+    candidate,
+    movie,
+    yearTolerance = 0,
+  ) => {
+    if (
+      !Number.isInteger(candidate.year)
+      || Math.abs(candidate.year - movie.year) > yearTolerance
+    ) {
       return false;
     }
     const expectedTitles = new Set(
@@ -944,14 +953,9 @@
     return response;
   };
 
-  const searchKinopoiskId = async (movie) => {
-    const searchTitle = movie.originalTitle || movie.title;
-    if (!searchTitle || !Number.isInteger(movie.year) || !movie.directors.length) {
-      return null;
-    }
-
+  const searchKinopoiskPass = async (movie, query, yearTolerance) => {
     const url = new URL(CONFIG.urls.kinopoiskSearch);
-    url.searchParams.set('kp_query', `${searchTitle} ${movie.year}`);
+    url.searchParams.set('kp_query', query);
     const response = await gmRequest({
       url: url.href,
       headers: { Accept: 'text/html' },
@@ -964,7 +968,9 @@
     const directId = getFilmIdFromUrl(response.finalUrl);
     if (directId) {
       const candidate = parseKinopoiskFilmPage(response);
-      return matchesKinopoiskCandidate(candidate, movie) ? directId : null;
+      return matchesKinopoiskCandidate(candidate, movie, yearTolerance)
+        ? [directId]
+        : [];
     }
 
     const expectedTitles = new Set(
@@ -974,7 +980,8 @@
     );
     const candidates = parseKinopoiskSearchResults(response.text)
       .filter((candidate) => (
-        candidate.year === movie.year
+        Number.isInteger(candidate.year)
+        && Math.abs(candidate.year - movie.year) <= yearTolerance
         && candidate.titles.some((title) => (
           expectedTitles.has(normalizeMatchText(title))
         ))
@@ -985,11 +992,33 @@
     for (const candidate of candidates) {
       const page = await fetchKinopoiskFilmPage(candidate.kinopoiskId);
       const fullCandidate = parseKinopoiskFilmPage(page);
-      if (matchesKinopoiskCandidate(fullCandidate, movie)) {
+      if (matchesKinopoiskCandidate(fullCandidate, movie, yearTolerance)) {
         matches.push(candidate.kinopoiskId);
       }
     }
-    return matches.length === 1 ? matches[0] : null;
+    return [...new Set(matches)];
+  };
+
+  const searchKinopoiskId = async (movie) => {
+    const searchTitle = movie.originalTitle || movie.title;
+    if (!searchTitle || !Number.isInteger(movie.year) || !movie.directors.length) {
+      return null;
+    }
+
+    const exactMatches = await searchKinopoiskPass(
+      movie,
+      `${searchTitle} ${movie.year}`,
+      0,
+    );
+    if (exactMatches.length === 1) return exactMatches[0];
+    if (exactMatches.length > 1) return null;
+
+    const relaxedMatches = await searchKinopoiskPass(
+      movie,
+      searchTitle,
+      CONFIG.kinopoiskYearTolerance,
+    );
+    return relaxedMatches.length === 1 ? relaxedMatches[0] : null;
   };
 
   const runWorkerPool = async (items, concurrency, task) => {
@@ -1249,9 +1278,17 @@
         'kpRating',
         imdbId,
       );
-      if (cached) {
+      const isCurrentCache = cached && (
+        cached.kinopoiskId
+        || Number.isFinite(cached.kpRating)
+        || cached.matchVersion === CONFIG.kinopoiskMatchVersion
+      );
+      if (isCurrentCache) {
         finishKinopoiskSubscriber(subscriber, cached);
         return;
+      }
+      if (cached) {
+        GM_deleteValue(`${CONFIG.cachePrefixes.kinopoisk}${imdbId}`);
       }
 
       const subscribers = subscribersById.get(imdbId) || [];
@@ -1339,7 +1376,12 @@
             return;
           }
 
-          const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
+          const data = {
+            kinopoiskId: null,
+            kpRating: null,
+            kpVotes: null,
+            matchVersion: CONFIG.kinopoiskMatchVersion,
+          };
           writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
           subscribers.forEach((subscriber) => {
             finishKinopoiskSubscriber(subscriber, data);
