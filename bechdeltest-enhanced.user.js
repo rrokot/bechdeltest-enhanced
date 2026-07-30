@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.7
+// @version      1.0.8
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -41,10 +41,9 @@
     filterKey: 'movie-ratings:filters:v1',
     cacheTtl: 7 * 24 * 60 * 60 * 1000,
     missCacheTtl: 24 * 60 * 60 * 1000,
-    kinopoiskBatchSize: 10,
+    kinopoiskConcurrency: 10,
     requestTimeout: 20_000,
     genreLimit: 3,
-    observerRootMargin: '150px 0px',
     ratingPrecision: 1,
     numberLocale: 'en-US',
     ratingTiers: Object.freeze([
@@ -66,14 +65,7 @@
     movieTitle: 'a[id^="movie-"]',
   });
 
-  const createBatchQueue = () => ({
-    active: false,
-    scheduled: false,
-    waiters: new Map(),
-  });
-
   const state = {
-    kinopoiskQueue: createBatchQueue(),
     filters: null,
     filterFrame: null,
     statusElement: null,
@@ -477,8 +469,8 @@
     applyFilters();
   };
 
-  // IMDb is requested for the whole page at once, while Kinopoisk is queued
-  // independently as its badges approach the viewport.
+  // Both sources start for the whole page. IMDb uses one GraphQL request;
+  // Kinopoisk resolves all ids once and fills ratings through a worker pool.
   const updateStatus = () => {
     const status = state.statusElement;
     if (!status) return;
@@ -657,10 +649,13 @@
       format: 'json',
     });
     const text = await gmRequest({
-      url: `${CONFIG.urls.wikidataSparql}?${params}`,
+      method: 'POST',
+      url: CONFIG.urls.wikidataSparql,
       headers: {
         Accept: 'application/sparql-results+json',
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
+      data: params.toString(),
     });
     const json = parseJson(text, 'Wikidata');
     return new Map(
@@ -754,113 +749,17 @@
     };
   };
 
-  // Kinopoisk is always one hop behind: its rating widget is keyed by an id that
-  // only Wikidata can supply. Kept as its own chain so IMDb never waits on it.
-  const fetchKinopoiskData = async (imdbIds) => {
-    const { value: ids, error } = await settle(fetchKinopoiskIds(imdbIds));
-    const ratings = new Map();
-    const failures = new Set();
-
-    if (ids) {
-      await Promise.all(imdbIds.map(async (imdbId) => {
-        const kinopoiskId = ids.get(imdbId);
-        if (!kinopoiskId) return;
-        const rating = await settle(fetchKinopoiskRating(kinopoiskId));
-        if (rating.value) {
-          ratings.set(imdbId, rating.value);
-          return;
-        }
-        if (!isMissingDataError(rating.error)) {
-          failures.add(imdbId);
-          console.warn('[Bechdel ratings]', imdbId, rating.error);
-        }
-      }));
-    }
-
-    return { ids: ids ?? new Map(), ratings, failures, error };
-  };
-
-  const scheduleKinopoiskBatch = () => {
-    const queue = state.kinopoiskQueue;
-    if (queue.active || queue.scheduled || !queue.waiters.size) return;
-    queue.scheduled = true;
-    queueMicrotask(flushKinopoiskBatch);
-  };
-
-  const takeKinopoiskBatch = () => {
-    const queue = state.kinopoiskQueue;
-    queue.scheduled = false;
-    if (queue.active || !queue.waiters.size) return null;
-    queue.active = true;
-
-    const imdbIds = [...queue.waiters.keys()]
-      .slice(0, CONFIG.kinopoiskBatchSize);
-    const waiters = new Map();
-    imdbIds.forEach((imdbId) => {
-      waiters.set(imdbId, queue.waiters.get(imdbId));
-      queue.waiters.delete(imdbId);
-    });
-    return { imdbIds, waiters };
-  };
-
-  const rejectBatch = (waiters, error) => {
-    waiters.forEach((subscribers) => {
-      subscribers.forEach(({ reject }) => reject(error));
-    });
-  };
-
-  const enqueueKinopoisk = (imdbId) => new Promise((resolve, reject) => {
-    const queue = state.kinopoiskQueue;
-    const waiters = queue.waiters.get(imdbId) || [];
-    waiters.push({ resolve, reject });
-    queue.waiters.set(imdbId, waiters);
-    scheduleKinopoiskBatch();
-  });
-
-  const flushKinopoiskBatch = async () => {
-    const queue = state.kinopoiskQueue;
-    const batch = takeKinopoiskBatch();
-    if (!batch) return;
-
-    try {
-      const result = await settle(fetchKinopoiskData(batch.imdbIds));
-      if (result.error || result.value.error) {
-        rejectBatch(batch.waiters, result.error || result.value.error);
-        return;
+  const runWorkerPool = async (items, concurrency, task) => {
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex];
+        nextIndex += 1;
+        await task(item);
       }
-
-      batch.imdbIds.forEach((imdbId) => {
-        if (result.value.failures.has(imdbId)) {
-          const error = new Error('Could not reach the Kinopoisk rating source');
-          batch.waiters.get(imdbId).forEach(({ reject }) => reject(error));
-          return;
-        }
-
-        const rating = result.value.ratings.get(imdbId) || {};
-        const data = {
-          kinopoiskId: result.value.ids.get(imdbId) || null,
-          kpRating: rating.kpRating ?? null,
-          kpVotes: rating.kpVotes ?? null,
-        };
-        writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
-        batch.waiters.get(imdbId).forEach(({ resolve }) => resolve(data));
-      });
-    } catch (error) {
-      rejectBatch(batch.waiters, error);
-    } finally {
-      queue.active = false;
-      scheduleKinopoiskBatch();
-    }
-  };
-
-  const loadKinopoisk = (imdbId) => {
-    const cached = readSourceCache(
-      CONFIG.cachePrefixes.kinopoisk,
-      'kpRating',
-      imdbId,
-    );
-    if (cached) return Promise.resolve(cached);
-    return enqueueKinopoisk(imdbId);
+    };
+    const workerCount = Math.min(concurrency, items.length);
+    await Promise.all(Array.from({ length: workerCount }, worker));
   };
 
   const formatVotes = (votes) => (
@@ -1050,37 +949,101 @@
     });
   };
 
-  const hydrateRating = async ({
-    load,
-    render,
-    badge,
-    label,
-    errorMessage,
-  }) => {
-    beginRating();
-    let failed = false;
+  const finishKinopoiskSubscriber = (subscriber, movie, error = null) => {
+    let failed = Boolean(error);
     try {
-      render(await load());
-    } catch (error) {
+      if (error) {
+        renderBadgeError(
+          subscriber.badge,
+          'KP',
+          'Could not reach the Kinopoisk rating source',
+        );
+      } else {
+        renderKinopoiskResult(subscriber.badge, movie);
+      }
+    } catch (renderError) {
       failed = true;
-      renderBadgeError(badge, label, errorMessage);
-      console.error('[Bechdel ratings]', error);
+      renderBadgeError(subscriber.badge, 'KP', 'Could not render Kinopoisk data');
+      console.error('[Bechdel ratings]', renderError);
     } finally {
       finishRating(failed);
     }
   };
 
-  const hydrateKinopoiskBadge = (kpBadge, imdbId) => {
-    if (kpBadge.dataset.requested === 'true') return;
-    kpBadge.dataset.requested = 'true';
+  const hydrateKinopoiskPage = async (targets) => {
+    const subscribersById = new Map();
 
-    void hydrateRating({
-      load: () => loadKinopoisk(imdbId),
-      render: (movie) => renderKinopoiskResult(kpBadge, movie),
-      badge: kpBadge,
-      label: 'KP',
-      errorMessage: 'Could not reach the Kinopoisk rating source',
+    targets.forEach(({ kpBadge, imdbId }) => {
+      beginRating();
+      const subscriber = { badge: kpBadge, imdbId };
+      const cached = readSourceCache(
+        CONFIG.cachePrefixes.kinopoisk,
+        'kpRating',
+        imdbId,
+      );
+      if (cached) {
+        finishKinopoiskSubscriber(subscriber, cached);
+        return;
+      }
+
+      const subscribers = subscribersById.get(imdbId) || [];
+      subscribers.push(subscriber);
+      subscribersById.set(imdbId, subscribers);
     });
+
+    const imdbIds = [...subscribersById.keys()];
+    if (!imdbIds.length) return;
+
+    const idsResult = await settle(fetchKinopoiskIds(imdbIds));
+    if (idsResult.error) {
+      console.error('[Bechdel ratings]', idsResult.error);
+      subscribersById.forEach((subscribers) => {
+        subscribers.forEach((subscriber) => {
+          finishKinopoiskSubscriber(subscriber, null, idsResult.error);
+        });
+      });
+      return;
+    }
+
+    const ratingTasks = [];
+    imdbIds.forEach((imdbId) => {
+      const subscribers = subscribersById.get(imdbId);
+      const kinopoiskId = idsResult.value.get(imdbId) || null;
+      if (!kinopoiskId) {
+        const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
+        writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
+        subscribers.forEach((subscriber) => {
+          finishKinopoiskSubscriber(subscriber, data);
+        });
+        return;
+      }
+      ratingTasks.push({ imdbId, kinopoiskId, subscribers });
+    });
+
+    await runWorkerPool(
+      ratingTasks,
+      CONFIG.kinopoiskConcurrency,
+      async ({ imdbId, kinopoiskId, subscribers }) => {
+        const result = await settle(fetchKinopoiskRating(kinopoiskId));
+        if (result.error && !isMissingDataError(result.error)) {
+          console.warn('[Bechdel ratings]', imdbId, result.error);
+          subscribers.forEach((subscriber) => {
+            finishKinopoiskSubscriber(subscriber, null, result.error);
+          });
+          return;
+        }
+
+        const data = {
+          kinopoiskId,
+          kpRating: result.value?.kpRating ?? null,
+          kpVotes: result.value?.kpVotes ?? null,
+        };
+        writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
+        subscribers.forEach((subscriber) => {
+          finishKinopoiskSubscriber(subscriber, data);
+        });
+      },
+    );
   };
 
   const createRatingBadge = ({ className, label, imdbId = null }) => {
@@ -1111,14 +1074,14 @@
     return { kpBadge, imdbBadge, genreElement };
   };
 
-  const enhanceMovie = ({ imdbLink, titleLink, immediate }) => {
+  const enhanceMovie = ({ imdbLink, titleLink }) => {
     const imdbId = extractImdbId(imdbLink?.href);
     if (!imdbId || !titleLink) return null;
 
     const { kpBadge, imdbBadge, genreElement } = createMovieMetadata(imdbId);
     titleLink.before(kpBadge, imdbBadge);
     titleLink.after(genreElement);
-    return { kpBadge, imdbId, immediate };
+    return { kpBadge, imdbId };
   };
 
   const collectTargets = () => {
@@ -1128,7 +1091,7 @@
       if (row.querySelector(`${SELECTORS.kpBadge}, ${SELECTORS.imdbBadge}`)) return;
       const imdbLink = row.querySelector(SELECTORS.imdbLink);
       const titleLink = row.querySelector(SELECTORS.movieTitle);
-      const target = enhanceMovie({ imdbLink, titleLink, immediate: false });
+      const target = enhanceMovie({ imdbLink, titleLink });
       if (target) targets.push(target);
     });
 
@@ -1141,7 +1104,6 @@
       const target = enhanceMovie({
         imdbLink,
         titleLink: imdbLink,
-        immediate: true,
       });
       if (target) targets.push(target);
     });
@@ -1155,19 +1117,7 @@
     addFilterPanel();
     if (!targets.length) return;
     void hydrateImdbPage(targets);
-
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        observer.unobserve(entry.target);
-        hydrateKinopoiskBadge(entry.target, entry.target.dataset.imdbId);
-      });
-    }, { rootMargin: CONFIG.observerRootMargin });
-
-    targets.forEach(({ kpBadge, imdbId, immediate }) => {
-      if (immediate) hydrateKinopoiskBadge(kpBadge, imdbId);
-      else observer.observe(kpBadge);
-    });
+    void hydrateKinopoiskPage(targets);
   };
 
   GM_registerMenuCommand('Clear rating cache', () => {

@@ -14,7 +14,7 @@ A lightweight Tampermonkey userscript that adds ratings, genres, and filters to
 - Multi-select genre exclusion filter
 - Wider, non-wrapping movie list on desktop
 - Progress indicator while ratings are still loading
-- Independent source loading, batching, and seven-day caching
+- Independent source loading, controlled concurrency, and seven-day caching
 - No API key or registration required
 
 ## Installation
@@ -48,9 +48,10 @@ The userscript uses the IMDb ID already present on Bechdel Test:
 - The public Kinopoisk XML rating widget provides KP ratings.
 - IMDb GraphQL provides IMDb ratings and genres.
 
-IMDb data loads for the whole page in one request. Kinopoisk data loads only for
-movies near the viewport. Successful results are cached for seven days, while
-missing results are cached for one day.
+IMDb data loads for the whole page in one request. Kinopoisk IDs are resolved in
+one Wikidata request, then individual rating XML files load through a concurrent
+worker pool. Successful results are cached for seven days, while missing results
+are cached for one day.
 
 ## License
 
