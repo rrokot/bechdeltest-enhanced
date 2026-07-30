@@ -13,6 +13,7 @@ A lightweight Tampermonkey userscript that adds ratings, genres, and filters to
 - Minimum Bechdel score filter
 - Multi-select genre exclusion filter
 - Wider, non-wrapping movie list on desktop
+- Progress indicator while ratings are still loading
 - Lazy loading, batching, and seven-day caching
 - No API key or registration required
 
