@@ -1,8 +1,0 @@
-# Local development loader contains an absolute machine-specific path.
-bechdel-local-loader.user.js
-
-# Editor and OS files
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
