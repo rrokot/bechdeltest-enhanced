@@ -34,13 +34,15 @@
       kinopoiskTitle: 'https://www.kinopoisk.ru/film',
       imdbTitle: 'https://www.imdb.com/title',
     }),
-    cachePrefix: 'movie-ratings:no-key:v2:',
+    cachePrefixes: Object.freeze({
+      imdb: 'movie-ratings:imdb:v1:',
+      kinopoisk: 'movie-ratings:kinopoisk:v1:',
+    }),
     filterKey: 'movie-ratings:filters:v1',
     cacheTtl: 7 * 24 * 60 * 60 * 1000,
     missCacheTtl: 24 * 60 * 60 * 1000,
     batchSize: 10,
     batchDelay: 80,
-    maxActiveMovies: 10,
     requestTimeout: 20_000,
     genreLimit: 3,
     observerRootMargin: '150px 0px',
@@ -65,17 +67,23 @@
     movieTitle: 'a[id^="movie-"]',
   });
 
+  const createBatchQueue = () => ({
+    active: false,
+    timer: null,
+    waiters: new Map(),
+  });
+
   const state = {
-    activeMovies: 0,
-    batchTimer: null,
-    batchWaiters: new Map(),
-    displayQueue: [],
+    queues: {
+      imdb: createBatchQueue(),
+      kinopoisk: createBatchQueue(),
+    },
     filters: null,
     filterFrame: null,
     statusElement: null,
-    queuedMovies: 0,
-    pendingMovies: 0,
-    failedMovies: 0,
+    queuedRatings: 0,
+    pendingRatings: 0,
+    failedRatings: 0,
   };
 
   const addStyles = () => {
@@ -215,7 +223,7 @@
       }
       @media (prefers-reduced-motion: reduce) {
         .rating-status[data-state="loading"]::before {
-          animation-duration: 2.5s;
+          animation: none;
         }
       }
       .genre-filter {
@@ -474,19 +482,19 @@
   };
 
   // The first visit has an empty cache and every rating is a round trip, so the
-  // list would otherwise sit there looking broken. Movies are queued lazily, so
-  // the total keeps growing as the reader scrolls.
+  // list would otherwise sit there looking broken. Sources are queued
+  // independently and lazily, so the total grows as the reader scrolls.
   const updateStatus = () => {
     const status = state.statusElement;
     if (!status) return;
 
-    if (state.pendingMovies) {
-      const done = state.queuedMovies - state.pendingMovies;
+    if (state.pendingRatings) {
+      const done = state.queuedRatings - state.pendingRatings;
       status.dataset.state = 'loading';
-      status.textContent = `Ratings ${done} / ${state.queuedMovies}`;
-    } else if (state.failedMovies) {
+      status.textContent = `Ratings ${done} / ${state.queuedRatings}`;
+    } else if (state.failedRatings) {
       status.dataset.state = 'failed';
-      status.textContent = `${state.failedMovies} unavailable`;
+      status.textContent = `${state.failedRatings} unavailable`;
       status.title = 'Some ratings could not be loaded and will be retried on the next visit';
     } else {
       status.dataset.state = 'idle';
@@ -571,21 +579,22 @@
 
   const extractImdbId = (href) => href?.match(/\/title\/(tt\d+)/i)?.[1] ?? null;
 
-  const readCache = (imdbId) => {
-    const key = `${CONFIG.cachePrefix}${imdbId}`;
+  const readSourceCache = (prefix, ratingKey, imdbId) => {
+    const key = `${prefix}${imdbId}`;
     const cached = GM_getValue(key, null);
     if (!cached || typeof cached.savedAt !== 'number') return null;
 
-    const hasAnyRating = cached.kpRating !== null || cached.imdbRating !== null;
-    const ttl = hasAnyRating ? CONFIG.cacheTtl : CONFIG.missCacheTtl;
+    const ttl = cached[ratingKey] !== null
+      ? CONFIG.cacheTtl
+      : CONFIG.missCacheTtl;
     if (Date.now() - cached.savedAt <= ttl) return cached;
 
     GM_deleteValue(key);
     return null;
   };
 
-  const writeCache = (imdbId, data) => {
-    GM_setValue(`${CONFIG.cachePrefix}${imdbId}`, {
+  const writeSourceCache = (prefix, imdbId, data) => {
+    GM_setValue(`${prefix}${imdbId}`, {
       ...data,
       savedAt: Date.now(),
     });
@@ -633,11 +642,10 @@
     }
   };
 
-  // A 4xx means the source answered and has nothing for this title, which is a
-  // real "no rating" worth caching. Timeouts, network errors, and 5xx are
-  // transient and must not be cached as missing data.
+  // Only explicit "not found" responses are real missing data. Other 4xx
+  // responses can be temporary authorization, timeout, or rate-limit failures.
   const isMissingDataError = (error) => (
-    Number.isFinite(error?.status) && error.status >= 400 && error.status < 500
+    error?.status === 404 || error?.status === 410
   );
 
   const fetchKinopoiskIds = async (imdbIds) => {
@@ -690,10 +698,27 @@
       data: body,
     });
     const json = parseJson(text, 'IMDb');
+    if (!json?.data || typeof json.data !== 'object') {
+      throw new Error('IMDb returned no data');
+    }
+
+    const failedAliases = new Set();
+    let hasUnscopedErrors = false;
+    if (Array.isArray(json.errors)) {
+      json.errors.forEach((error) => {
+        const alias = error?.path?.[0];
+        if (typeof alias === 'string' && /^t\d+$/.test(alias)) {
+          failedAliases.add(alias);
+        } else {
+          hasUnscopedErrors = true;
+        }
+      });
+    }
 
     return new Map(imdbIds.map((imdbId, index) => {
-      const rating = json?.data?.[`t${index}`]?.ratingsSummary;
-      const genres = json?.data?.[`t${index}`]?.genres?.genres;
+      const alias = `t${index}`;
+      const rating = json.data[alias]?.ratingsSummary;
+      const genres = json.data[alias]?.genres?.genres;
       return [imdbId, {
         imdbRating: Number.isFinite(rating?.aggregateRating)
           ? rating.aggregateRating
@@ -707,6 +732,7 @@
             .filter(Boolean)
             .slice(0, CONFIG.genreLimit)
           : [],
+        imdbError: hasUnscopedErrors || failedAliases.has(alias),
       }];
     }));
   };
@@ -759,97 +785,132 @@
     return { ids: ids ?? new Map(), ratings, failures, error };
   };
 
-  const flushBatch = async () => {
-    state.batchTimer = null;
-    const imdbIds = [...state.batchWaiters.keys()].slice(0, CONFIG.batchSize);
+  const scheduleBatch = (queue, flush) => {
+    if (queue.active || queue.timer || !queue.waiters.size) return;
+    queue.timer = window.setTimeout(flush, CONFIG.batchDelay);
+  };
+
+  const takeBatch = (queue) => {
+    queue.timer = null;
+    if (queue.active || !queue.waiters.size) return null;
+    queue.active = true;
+
+    const imdbIds = [...queue.waiters.keys()].slice(0, CONFIG.batchSize);
     const waiters = new Map();
     imdbIds.forEach((imdbId) => {
-      waiters.set(imdbId, state.batchWaiters.get(imdbId));
-      state.batchWaiters.delete(imdbId);
+      waiters.set(imdbId, queue.waiters.get(imdbId));
+      queue.waiters.delete(imdbId);
     });
+    return { imdbIds, waiters };
+  };
 
-    if (state.batchWaiters.size) {
-      state.batchTimer = window.setTimeout(flushBatch, CONFIG.batchDelay);
-    }
+  const finishBatch = (queue, flush) => {
+    queue.active = false;
+    scheduleBatch(queue, flush);
+  };
 
-    // Both chains start together, but IMDb is delivered the moment it lands
-    // rather than being held back until the slower Kinopoisk chain finishes.
-    const kinopoiskData = fetchKinopoiskData(imdbIds);
-    const imdbResult = await settle(fetchImdbRatings(imdbIds));
-
-    const readImdb = (imdbId) => {
-      const entry = imdbResult.value?.get(imdbId) || {};
-      return {
-        imdbRating: entry.imdbRating ?? null,
-        imdbVotes: entry.imdbVotes ?? null,
-        genres: entry.genres ?? [],
-        imdbError: Boolean(imdbResult.error),
-      };
-    };
-
-    imdbIds.forEach((imdbId) => {
-      const partial = {
-        ...readImdb(imdbId),
-        kinopoiskId: null,
-        kpRating: null,
-        kpVotes: null,
-        kpPending: true,
-      };
-      // An early paint must never take the batch down with it, or every badge
-      // in it would stay stuck on the loading placeholder.
-      waiters.get(imdbId).forEach(({ onPartial }) => {
-        try {
-          onPartial(partial);
-        } catch (error) {
-          console.error('[Bechdel ratings]', error);
-        }
-      });
-    });
-
-    const kinopoisk = await kinopoiskData;
-
-    if (kinopoisk.error && imdbResult.error) {
-      waiters.forEach((subscribers) => {
-        subscribers.forEach(({ reject }) => reject(imdbResult.error));
-      });
-      return;
-    }
-
-    imdbIds.forEach((imdbId) => {
-      const imdbData = readImdb(imdbId);
-      const kpEntry = kinopoisk.ratings.get(imdbId) || {};
-      const kpError = Boolean(kinopoisk.error) || kinopoisk.failures.has(imdbId);
-      const data = {
-        kinopoiskId: kinopoisk.ids.get(imdbId) || null,
-        kpRating: kpEntry.kpRating ?? null,
-        kpVotes: kpEntry.kpVotes ?? null,
-        imdbRating: imdbData.imdbRating,
-        imdbVotes: imdbData.imdbVotes,
-        genres: imdbData.genres,
-      };
-      // Only a complete answer is worth keeping for a week; a partial one is
-      // shown now and re-fetched on the next visit.
-      if (!kpError && !imdbData.imdbError) writeCache(imdbId, data);
-      waiters.get(imdbId).forEach(({ resolve }) => resolve({
-        ...data,
-        kpError,
-        imdbError: imdbData.imdbError,
-      }));
+  const rejectBatch = (waiters, error) => {
+    waiters.forEach((subscribers) => {
+      subscribers.forEach(({ reject }) => reject(error));
     });
   };
 
-  const loadMovie = (imdbId, onPartial) => {
-    const cached = readCache(imdbId);
-    if (cached) return Promise.resolve(cached);
+  const enqueueBatch = (queue, flush, imdbId) => new Promise((resolve, reject) => {
+    const waiters = queue.waiters.get(imdbId) || [];
+    waiters.push({ resolve, reject });
+    queue.waiters.set(imdbId, waiters);
+    scheduleBatch(queue, flush);
+  });
 
-    return new Promise((resolve, reject) => {
-      const waiters = state.batchWaiters.get(imdbId) || [];
-      waiters.push({ resolve, reject, onPartial });
-      state.batchWaiters.set(imdbId, waiters);
-      if (!state.batchTimer) {
-        state.batchTimer = window.setTimeout(flushBatch, CONFIG.batchDelay);
+  const flushImdbBatch = async () => {
+    const queue = state.queues.imdb;
+    const batch = takeBatch(queue);
+    if (!batch) return;
+
+    try {
+      const result = await settle(fetchImdbRatings(batch.imdbIds));
+      if (result.error) {
+        rejectBatch(batch.waiters, result.error);
+        return;
       }
-    });
+
+      batch.imdbIds.forEach((imdbId) => {
+        const entry = result.value.get(imdbId);
+        if (!entry || entry.imdbError) {
+          const error = new Error('IMDb returned an error for this title');
+          batch.waiters.get(imdbId).forEach(({ reject }) => reject(error));
+          return;
+        }
+
+        const {
+          imdbRating,
+          imdbVotes,
+          genres,
+        } = entry;
+        const data = { imdbRating, imdbVotes, genres };
+        writeSourceCache(CONFIG.cachePrefixes.imdb, imdbId, data);
+        batch.waiters.get(imdbId).forEach(({ resolve }) => resolve(data));
+      });
+    } catch (error) {
+      rejectBatch(batch.waiters, error);
+    } finally {
+      finishBatch(queue, flushImdbBatch);
+    }
+  };
+
+  const flushKinopoiskBatch = async () => {
+    const queue = state.queues.kinopoisk;
+    const batch = takeBatch(queue);
+    if (!batch) return;
+
+    try {
+      const result = await settle(fetchKinopoiskData(batch.imdbIds));
+      if (result.error || result.value.error) {
+        rejectBatch(batch.waiters, result.error || result.value.error);
+        return;
+      }
+
+      batch.imdbIds.forEach((imdbId) => {
+        if (result.value.failures.has(imdbId)) {
+          const error = new Error('Could not reach the Kinopoisk rating source');
+          batch.waiters.get(imdbId).forEach(({ reject }) => reject(error));
+          return;
+        }
+
+        const rating = result.value.ratings.get(imdbId) || {};
+        const data = {
+          kinopoiskId: result.value.ids.get(imdbId) || null,
+          kpRating: rating.kpRating ?? null,
+          kpVotes: rating.kpVotes ?? null,
+        };
+        writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
+        batch.waiters.get(imdbId).forEach(({ resolve }) => resolve(data));
+      });
+    } catch (error) {
+      rejectBatch(batch.waiters, error);
+    } finally {
+      finishBatch(queue, flushKinopoiskBatch);
+    }
+  };
+
+  const loadImdb = (imdbId) => {
+    const cached = readSourceCache(
+      CONFIG.cachePrefixes.imdb,
+      'imdbRating',
+      imdbId,
+    );
+    if (cached) return Promise.resolve(cached);
+    return enqueueBatch(state.queues.imdb, flushImdbBatch, imdbId);
+  };
+
+  const loadKinopoisk = (imdbId) => {
+    const cached = readSourceCache(
+      CONFIG.cachePrefixes.kinopoisk,
+      'kpRating',
+      imdbId,
+    );
+    if (cached) return Promise.resolve(cached);
+    return enqueueBatch(state.queues.kinopoisk, flushKinopoiskBatch, imdbId);
   };
 
   const formatVotes = (votes) => (
@@ -909,100 +970,90 @@
     badge.setAttribute('aria-label', `Could not load the ${label} rating`);
   };
 
-  const renderResult = (kpBadge, movie) => {
-    const imdbBadge = getImdbBadge(kpBadge);
-    const genreElement = getGenreElement(kpBadge);
-    const imdbId = kpBadge.dataset.imdbId;
+  const renderKinopoiskResult = (badge, movie) => {
+    renderRating({
+      badge,
+      label: 'KP',
+      rating: movie.kpRating,
+      votes: movie.kpVotes,
+      href: movie.kinopoiskId
+        ? `${CONFIG.urls.kinopoiskTitle}/${movie.kinopoiskId}/`
+        : null,
+      missingMessage: movie.kinopoiskId
+        ? 'This title has no Kinopoisk rating yet'
+        : 'Wikidata has no Kinopoisk ID for this IMDb title',
+    });
+  };
 
-    // On the first pass the Kinopoisk chain is still in flight, so its badge is
-    // left loading and gets filled in by the second call.
-    if (!movie.kpPending) {
-      if (movie.kpError) {
-        renderBadgeError(kpBadge, 'KP', 'Could not reach the Kinopoisk rating source');
-      } else {
-        renderRating({
-          badge: kpBadge,
-          label: 'KP',
-          rating: movie.kpRating,
-          votes: movie.kpVotes,
-          href: movie.kinopoiskId
-            ? `${CONFIG.urls.kinopoiskTitle}/${movie.kinopoiskId}/`
-            : null,
-          missingMessage: 'Wikidata has no Kinopoisk ID for this IMDb title',
-        });
-      }
-    }
-
-    if (imdbBadge) {
-      if (movie.imdbError) {
-        renderBadgeError(imdbBadge, 'IMDb', 'Could not reach IMDb');
-      } else {
-        renderRating({
-          badge: imdbBadge,
-          label: 'IMDb',
-          rating: movie.imdbRating,
-          votes: movie.imdbVotes,
-          href: `${CONFIG.urls.imdbTitle}/${imdbId}/`,
-          missingMessage: 'This title has no IMDb rating yet',
-        });
-      }
-    }
-    // Genres come from IMDb, so leave them unloaded when IMDb failed rather
-    // than claiming the movie has none.
-    if (genreElement && !movie.imdbError) {
+  const renderImdbResult = (badge, genreElement, imdbId, movie) => {
+    renderRating({
+      badge,
+      label: 'IMDb',
+      rating: movie.imdbRating,
+      votes: movie.imdbVotes,
+      href: `${CONFIG.urls.imdbTitle}/${imdbId}/`,
+      missingMessage: 'This title has no IMDb rating yet',
+    });
+    if (genreElement) {
       genreElement.textContent = movie.genres.join(', ');
       genreElement.dataset.genres = movie.genres.join('|');
       genreElement.dataset.loaded = 'true';
       genreElement.hidden = movie.genres.length === 0;
       updateGenreFilterOptions(movie.genres);
     }
-    scheduleFilters();
   };
 
-  const renderError = (kpBadge, error) => {
-    const imdbBadge = getImdbBadge(kpBadge);
-    renderBadgeError(kpBadge, 'KP', error.message);
-    if (imdbBadge) renderBadgeError(imdbBadge, 'IMDb', error.message);
-    console.error('[Bechdel ratings]', error);
-    scheduleFilters();
-  };
-
-  const pumpDisplayQueue = () => {
-    while (
-      state.activeMovies < CONFIG.maxActiveMovies
-      && state.displayQueue.length
-    ) {
-      const task = state.displayQueue.shift();
-      state.activeMovies += 1;
-      task().finally(() => {
-        state.activeMovies -= 1;
-        pumpDisplayQueue();
-      });
+  const hydrateRating = async ({
+    load,
+    render,
+    badge,
+    label,
+    errorMessage,
+  }) => {
+    state.queuedRatings += 1;
+    state.pendingRatings += 1;
+    updateStatus();
+    try {
+      render(await load());
+    } catch (error) {
+      renderBadgeError(badge, label, errorMessage);
+      state.failedRatings += 1;
+      console.error('[Bechdel ratings]', error);
+    } finally {
+      state.pendingRatings -= 1;
+      updateStatus();
+      scheduleFilters();
     }
   };
 
   const hydrateBadges = (kpBadge, imdbId) => {
     if (kpBadge.dataset.requested === 'true') return;
     kpBadge.dataset.requested = 'true';
-    state.queuedMovies += 1;
-    state.pendingMovies += 1;
-    updateStatus();
-    state.displayQueue.push(async () => {
-      try {
-        const movie = await loadMovie(imdbId, (partial) => {
-          renderResult(kpBadge, partial);
-        });
-        renderResult(kpBadge, movie);
-        if (movie.kpError || movie.imdbError) state.failedMovies += 1;
-      } catch (error) {
-        renderError(kpBadge, error);
-        state.failedMovies += 1;
-      } finally {
-        state.pendingMovies -= 1;
-        updateStatus();
-      }
+    const imdbBadge = getImdbBadge(kpBadge);
+    const genreElement = getGenreElement(kpBadge);
+
+    void hydrateRating({
+      load: () => loadKinopoisk(imdbId),
+      render: (movie) => renderKinopoiskResult(kpBadge, movie),
+      badge: kpBadge,
+      label: 'KP',
+      errorMessage: 'Could not reach the Kinopoisk rating source',
     });
-    pumpDisplayQueue();
+
+    if (imdbBadge) {
+      void hydrateRating({
+        load: () => loadImdb(imdbId),
+        render: (movie) => renderImdbResult(
+          imdbBadge,
+          genreElement,
+          imdbId,
+          movie,
+        ),
+        badge: imdbBadge,
+        label: 'IMDb',
+        errorMessage: 'Could not reach IMDb',
+      });
+    }
   };
 
   const createRatingBadge = ({ className, label, imdbId = null }) => {
@@ -1092,8 +1143,9 @@
   };
 
   GM_registerMenuCommand('Clear rating cache', () => {
+    const prefixes = Object.values(CONFIG.cachePrefixes);
     GM_listValues()
-      .filter((key) => key.startsWith(CONFIG.cachePrefix))
+      .filter((key) => prefixes.some((prefix) => key.startsWith(prefix)))
       .forEach((key) => GM_deleteValue(key));
     window.location.reload();
   });
