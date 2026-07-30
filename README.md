@@ -49,23 +49,6 @@ The userscript uses the IMDb ID already present on Bechdel Test:
 Data loads only for movies near the viewport. Successful results are cached for
 seven days, while missing results are cached for one day.
 
-## Development
-
-For local development, create a small Tampermonkey loader with:
-
-```javascript
-// @require file:///absolute/path/to/bechdeltest-enhanced.user.js
-```
-
-Enable file URL access for Tampermonkey in the browser extension settings, then
-reload Bechdel Test after each local change.
-
-Validate the script with:
-
-```bash
-node --check bechdeltest-enhanced.user.js
-```
-
 ## License
 
 [MIT](LICENSE)
