@@ -53,6 +53,11 @@ one Wikidata request, then individual rating XML files load through a concurrent
 worker pool. Successful results are cached for seven days, while missing results
 are cached for one day.
 
+When Wikidata has no Kinopoisk ID, the userscript performs a sequential
+Kinopoisk search using the IMDb title and year. A result is accepted only when
+its normalized title, year, and director all match the IMDb metadata exactly.
+Blocked, missing, or ambiguous search results remain unresolved.
+
 ## License
 
 [MIT](LICENSE)

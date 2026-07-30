@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.8
+// @version      1.0.9
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -13,6 +13,7 @@
 // @match        https://www.bechdeltest.com/*
 // @connect      query.wikidata.org
 // @connect      rating.kinopoisk.ru
+// @connect      www.kinopoisk.ru
 // @connect      api.graphql.imdb.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -31,17 +32,20 @@
       wikidataSparql: 'https://query.wikidata.org/sparql',
       imdbGraphql: 'https://api.graphql.imdb.com/',
       kinopoiskRating: 'https://rating.kinopoisk.ru',
+      kinopoiskSearch: 'https://www.kinopoisk.ru/index.php',
       kinopoiskTitle: 'https://www.kinopoisk.ru/film',
       imdbTitle: 'https://www.imdb.com/title',
     }),
     cachePrefixes: Object.freeze({
       imdb: 'movie-ratings:imdb:v1:',
-      kinopoisk: 'movie-ratings:kinopoisk:v1:',
+      kinopoisk: 'movie-ratings:kinopoisk:v2:',
     }),
     filterKey: 'movie-ratings:filters:v1',
     cacheTtl: 7 * 24 * 60 * 60 * 1000,
     missCacheTtl: 24 * 60 * 60 * 1000,
     kinopoiskConcurrency: 10,
+    kinopoiskSearchConcurrency: 1,
+    kinopoiskCandidateLimit: 3,
     requestTimeout: 20_000,
     genreLimit: 3,
     ratingPrecision: 1,
@@ -592,6 +596,7 @@
     url,
     headers = {},
     data,
+    includeResponse = false,
   }) => new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method,
@@ -601,7 +606,10 @@
       timeout: CONFIG.requestTimeout,
       onload: (response) => {
         if (response.status >= 200 && response.status < 300) {
-          resolve(response.responseText);
+          resolve(includeResponse ? {
+            text: response.responseText,
+            finalUrl: response.finalUrl || url,
+          } : response.responseText);
           return;
         }
         const error = new Error(`HTTP ${response.status}`);
@@ -707,8 +715,9 @@
 
     return new Map(imdbIds.map((imdbId, index) => {
       const alias = `t${index}`;
-      const rating = json.data[alias]?.ratingsSummary;
-      const genres = json.data[alias]?.genres?.genres;
+      const title = json.data[alias];
+      const rating = title?.ratingsSummary;
+      const genres = title?.genres?.genres;
       return [imdbId, {
         imdbRating: Number.isFinite(rating?.aggregateRating)
           ? rating.aggregateRating
@@ -723,6 +732,72 @@
             .slice(0, CONFIG.genreLimit)
           : [],
         imdbError: hasUnscopedErrors || failedAliases.has(alias),
+      }];
+    }));
+  };
+
+  const fetchImdbMetadata = async (imdbIds) => {
+    const fields = imdbIds
+      .map((id, index) => (
+        `t${index}: title(id: "${id}") {
+          titleText { text }
+          originalTitleText { text }
+          releaseYear { year }
+          principalCredits {
+            credits {
+              category { id }
+              name { nameText { text } }
+            }
+          }
+        }`
+      ))
+      .join('\n');
+    const text = await gmRequest({
+      method: 'POST',
+      url: CONFIG.urls.imdbGraphql,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      data: JSON.stringify({
+        query: `query BechdelMetadata { ${fields} }`,
+      }),
+    });
+    const json = parseJson(text, 'IMDb');
+    if (!json?.data || typeof json.data !== 'object') {
+      throw new Error('IMDb returned no metadata');
+    }
+
+    const failedAliases = new Set();
+    let hasUnscopedErrors = false;
+    if (Array.isArray(json.errors)) {
+      json.errors.forEach((error) => {
+        const alias = error?.path?.[0];
+        if (typeof alias === 'string' && /^t\d+$/.test(alias)) {
+          failedAliases.add(alias);
+        } else {
+          hasUnscopedErrors = true;
+        }
+      });
+    }
+
+    return new Map(imdbIds.map((imdbId, index) => {
+      const alias = `t${index}`;
+      const title = json.data[alias];
+      const credits = Array.isArray(title?.principalCredits)
+        ? title.principalCredits.flatMap((group) => group.credits || [])
+        : [];
+      return [imdbId, {
+        title: title?.titleText?.text || '',
+        originalTitle: title?.originalTitleText?.text || '',
+        year: Number.isInteger(title?.releaseYear?.year)
+          ? title.releaseYear.year
+          : null,
+        directors: credits
+          .filter((credit) => credit?.category?.id === 'director')
+          .map((credit) => credit?.name?.nameText?.text)
+          .filter(Boolean),
+        metadataError: hasUnscopedErrors || failedAliases.has(alias),
       }];
     }));
   };
@@ -747,6 +822,174 @@
       kpRating: Number.isFinite(kpRating) ? kpRating : null,
       kpVotes: Number.isFinite(kpVotes) ? kpVotes : null,
     };
+  };
+
+  const normalizeMatchText = (value) => (
+    String(value || '')
+      .normalize('NFKD')
+      .replace(/\p{Mark}/gu, '')
+      .toLocaleLowerCase('en-US')
+      .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
+      .trim()
+  );
+
+  const getFilmIdFromUrl = (url) => (
+    String(url || '').match(/\/film\/(\d+)(?:\/|$)/)?.[1] ?? null
+  );
+
+  const isKinopoiskWebUrl = (url) => {
+    const hostname = new URL(url).hostname;
+    return hostname === 'kinopoisk.ru' || hostname === 'www.kinopoisk.ru';
+  };
+
+  const getOriginalPersonName = (html, personId) => {
+    const match = html.match(new RegExp(
+      `"Person:${personId}"\\s*:\\s*\\{[^{}]{0,1200}?`
+      + '"originalName":("(?:\\\\.|[^"\\\\])*"|null)',
+    ));
+    if (!match || match[1] === 'null') return '';
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return '';
+    }
+  };
+
+  const parseKinopoiskFilmPage = (response) => {
+    const documentNode = new DOMParser().parseFromString(response.text, 'text/html');
+    const headingTitle = documentNode.querySelector('h1')?.textContent
+      ?.replace(/\s*\((?:18|19|20)\d{2}\)\s*$/, '')
+      .trim();
+    const yearText = documentNode
+      .querySelector('[data-test-id="year"]')
+      ?.textContent;
+    const directorLinks = [
+      ...documentNode.querySelectorAll(
+        '[data-test-id="directors"] a[href*="/name/"]',
+      ),
+    ];
+    const directors = directorLinks.flatMap((link) => {
+      const personId = link.href.match(/\/name\/(\d+)/)?.[1];
+      return [
+        link.textContent,
+        personId ? getOriginalPersonName(response.text, personId) : '',
+      ].filter(Boolean);
+    });
+
+    return {
+      kinopoiskId: getFilmIdFromUrl(response.finalUrl)
+        || getFilmIdFromUrl(
+          documentNode.querySelector('link[rel="canonical"]')?.href,
+        ),
+      titles: [
+        headingTitle,
+        documentNode.querySelector('[class*="originalTitle"]')?.textContent,
+      ].filter(Boolean),
+      year: Number.parseInt(yearText?.match(/\b(?:18|19|20)\d{2}\b/)?.[0], 10),
+      directors,
+    };
+  };
+
+  const parseKinopoiskSearchResults = (html) => {
+    const documentNode = new DOMParser().parseFromString(html, 'text/html');
+    return [...documentNode.querySelectorAll('.element')].map((element) => {
+      const titleLink = element.querySelector('.info .name a[data-id]');
+      const originalText = element.querySelector('.info > span.gray')?.textContent
+        ?.trim();
+      const originalTitle = /^\d+\s*\D+$/u.test(originalText || '')
+        ? ''
+        : originalText?.replace(/,\s*\d+\s*\D+$/u, '').trim();
+      return {
+        kinopoiskId: titleLink?.dataset.id
+          || getFilmIdFromUrl(titleLink?.href),
+        titles: [titleLink?.textContent, originalTitle].filter(Boolean),
+        year: Number.parseInt(
+          element.querySelector('.info .name .year')?.textContent,
+          10,
+        ),
+      };
+    }).filter(({ kinopoiskId }) => kinopoiskId);
+  };
+
+  const matchesKinopoiskCandidate = (candidate, movie) => {
+    if (!Number.isInteger(candidate.year) || candidate.year !== movie.year) {
+      return false;
+    }
+    const expectedTitles = new Set(
+      [movie.originalTitle, movie.title]
+        .map(normalizeMatchText)
+        .filter(Boolean),
+    );
+    if (!candidate.titles.some((title) => (
+      expectedTitles.has(normalizeMatchText(title))
+    ))) return false;
+
+    const expectedDirectors = new Set(
+      movie.directors.map(normalizeMatchText).filter(Boolean),
+    );
+    return candidate.directors.some((director) => (
+      expectedDirectors.has(normalizeMatchText(director))
+    ));
+  };
+
+  const fetchKinopoiskFilmPage = async (kinopoiskId) => {
+    const response = await gmRequest({
+      url: `${CONFIG.urls.kinopoiskTitle}/${kinopoiskId}/`,
+      headers: { Accept: 'text/html' },
+      includeResponse: true,
+    });
+    if (!isKinopoiskWebUrl(response.finalUrl)) {
+      throw new Error('Kinopoisk film page redirected outside Kinopoisk');
+    }
+    return response;
+  };
+
+  const searchKinopoiskId = async (movie) => {
+    const searchTitle = movie.originalTitle || movie.title;
+    if (!searchTitle || !Number.isInteger(movie.year) || !movie.directors.length) {
+      return null;
+    }
+
+    const url = new URL(CONFIG.urls.kinopoiskSearch);
+    url.searchParams.set('kp_query', `${searchTitle} ${movie.year}`);
+    const response = await gmRequest({
+      url: url.href,
+      headers: { Accept: 'text/html' },
+      includeResponse: true,
+    });
+    if (!isKinopoiskWebUrl(response.finalUrl)) {
+      throw new Error('Kinopoisk search redirected outside Kinopoisk');
+    }
+
+    const directId = getFilmIdFromUrl(response.finalUrl);
+    if (directId) {
+      const candidate = parseKinopoiskFilmPage(response);
+      return matchesKinopoiskCandidate(candidate, movie) ? directId : null;
+    }
+
+    const expectedTitles = new Set(
+      [movie.originalTitle, movie.title]
+        .map(normalizeMatchText)
+        .filter(Boolean),
+    );
+    const candidates = parseKinopoiskSearchResults(response.text)
+      .filter((candidate) => (
+        candidate.year === movie.year
+        && candidate.titles.some((title) => (
+          expectedTitles.has(normalizeMatchText(title))
+        ))
+      ))
+      .slice(0, CONFIG.kinopoiskCandidateLimit);
+
+    const matches = [];
+    for (const candidate of candidates) {
+      const page = await fetchKinopoiskFilmPage(candidate.kinopoiskId);
+      const fullCandidate = parseKinopoiskFilmPage(page);
+      if (matchesKinopoiskCandidate(fullCandidate, movie)) {
+        matches.push(candidate.kinopoiskId);
+      }
+    }
+    return matches.length === 1 ? matches[0] : null;
   };
 
   const runWorkerPool = async (items, concurrency, task) => {
@@ -830,7 +1073,7 @@
         : null,
       missingMessage: movie.kinopoiskId
         ? 'This title has no Kinopoisk rating yet'
-        : 'Wikidata has no Kinopoisk ID for this IMDb title',
+        : 'No verified Kinopoisk match was found',
     });
   };
 
@@ -970,6 +1213,31 @@
     }
   };
 
+  const hydrateKinopoiskRatingTask = async ({
+    imdbId,
+    kinopoiskId,
+    subscribers,
+  }) => {
+    const result = await settle(fetchKinopoiskRating(kinopoiskId));
+    if (result.error && !isMissingDataError(result.error)) {
+      console.warn('[Bechdel ratings]', imdbId, result.error);
+      subscribers.forEach((subscriber) => {
+        finishKinopoiskSubscriber(subscriber, null, result.error);
+      });
+      return;
+    }
+
+    const data = {
+      kinopoiskId,
+      kpRating: result.value?.kpRating ?? null,
+      kpVotes: result.value?.kpVotes ?? null,
+    };
+    writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
+    subscribers.forEach((subscriber) => {
+      finishKinopoiskSubscriber(subscriber, data);
+    });
+  };
+
   const hydrateKinopoiskPage = async (targets) => {
     const subscribersById = new Map();
 
@@ -1006,44 +1274,84 @@
     }
 
     const ratingTasks = [];
+    const fallbackTasks = [];
     imdbIds.forEach((imdbId) => {
       const subscribers = subscribersById.get(imdbId);
       const kinopoiskId = idsResult.value.get(imdbId) || null;
       if (!kinopoiskId) {
-        const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
-        writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
-        subscribers.forEach((subscriber) => {
-          finishKinopoiskSubscriber(subscriber, data);
-        });
+        fallbackTasks.push({ imdbId, subscribers });
         return;
       }
       ratingTasks.push({ imdbId, kinopoiskId, subscribers });
     });
 
-    await runWorkerPool(
+    const ratings = runWorkerPool(
       ratingTasks,
       CONFIG.kinopoiskConcurrency,
-      async ({ imdbId, kinopoiskId, subscribers }) => {
-        const result = await settle(fetchKinopoiskRating(kinopoiskId));
-        if (result.error && !isMissingDataError(result.error)) {
-          console.warn('[Bechdel ratings]', imdbId, result.error);
-          subscribers.forEach((subscriber) => {
-            finishKinopoiskSubscriber(subscriber, null, result.error);
-          });
-          return;
-        }
-
-        const data = {
-          kinopoiskId,
-          kpRating: result.value?.kpRating ?? null,
-          kpVotes: result.value?.kpVotes ?? null,
-        };
-        writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
-        subscribers.forEach((subscriber) => {
-          finishKinopoiskSubscriber(subscriber, data);
-        });
-      },
+      hydrateKinopoiskRatingTask,
     );
+
+    const fallbacks = (async () => {
+      if (!fallbackTasks.length) return;
+      const metadata = await settle(fetchImdbMetadata(
+        fallbackTasks.map(({ imdbId }) => imdbId),
+      ));
+      if (metadata.error) {
+        console.warn('[Bechdel ratings]', metadata.error);
+        fallbackTasks.forEach(({ subscribers }) => {
+          const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
+          subscribers.forEach((subscriber) => {
+            finishKinopoiskSubscriber(subscriber, data);
+          });
+        });
+        return;
+      }
+
+      await runWorkerPool(
+        fallbackTasks,
+        CONFIG.kinopoiskSearchConcurrency,
+        async ({ imdbId, subscribers }) => {
+          const movie = metadata.value.get(imdbId);
+          if (!movie || movie.metadataError) {
+            const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
+            subscribers.forEach((subscriber) => {
+              finishKinopoiskSubscriber(subscriber, data);
+            });
+            return;
+          }
+
+          const lookup = await settle(searchKinopoiskId(movie));
+          if (lookup.error) {
+            console.warn('[Bechdel ratings]', imdbId, lookup.error);
+            const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
+            subscribers.forEach((subscriber) => {
+              finishKinopoiskSubscriber(subscriber, data);
+            });
+            return;
+          }
+
+          if (lookup.value) {
+            await hydrateKinopoiskRatingTask({
+              imdbId,
+              kinopoiskId: lookup.value,
+              subscribers,
+            });
+            return;
+          }
+
+          const data = { kinopoiskId: null, kpRating: null, kpVotes: null };
+          writeSourceCache(CONFIG.cachePrefixes.kinopoisk, imdbId, data);
+          subscribers.forEach((subscriber) => {
+            finishKinopoiskSubscriber(subscriber, data);
+          });
+        },
+      );
+    })();
+
+    await Promise.all([
+      ratings,
+      fallbacks,
+    ]);
   };
 
   const createRatingBadge = ({ className, label, imdbId = null }) => {
