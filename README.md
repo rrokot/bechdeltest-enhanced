@@ -48,8 +48,9 @@ The userscript uses the IMDb ID already present on Bechdel Test:
 - The public Kinopoisk XML rating widget provides KP ratings.
 - IMDb GraphQL provides IMDb ratings and genres.
 
-Data loads only for movies near the viewport. Successful results are cached for
-seven days, while missing results are cached for one day.
+IMDb data loads for the whole page in one request. Kinopoisk data loads only for
+movies near the viewport. Successful results are cached for seven days, while
+missing results are cached for one day.
 
 ## License
 

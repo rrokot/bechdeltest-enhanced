@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.6
+// @version      1.0.7
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -41,8 +41,7 @@
     filterKey: 'movie-ratings:filters:v1',
     cacheTtl: 7 * 24 * 60 * 60 * 1000,
     missCacheTtl: 24 * 60 * 60 * 1000,
-    batchSize: 10,
-    batchDelay: 80,
+    kinopoiskBatchSize: 10,
     requestTimeout: 20_000,
     genreLimit: 3,
     observerRootMargin: '150px 0px',
@@ -69,15 +68,12 @@
 
   const createBatchQueue = () => ({
     active: false,
-    timer: null,
+    scheduled: false,
     waiters: new Map(),
   });
 
   const state = {
-    queues: {
-      imdb: createBatchQueue(),
-      kinopoisk: createBatchQueue(),
-    },
+    kinopoiskQueue: createBatchQueue(),
     filters: null,
     filterFrame: null,
     statusElement: null,
@@ -481,9 +477,8 @@
     applyFilters();
   };
 
-  // The first visit has an empty cache and every rating is a round trip, so the
-  // list would otherwise sit there looking broken. Sources are queued
-  // independently and lazily, so the total grows as the reader scrolls.
+  // IMDb is requested for the whole page at once, while Kinopoisk is queued
+  // independently as its badges approach the viewport.
   const updateStatus = () => {
     const status = state.statusElement;
     if (!status) return;
@@ -785,17 +780,21 @@
     return { ids: ids ?? new Map(), ratings, failures, error };
   };
 
-  const scheduleBatch = (queue, flush) => {
-    if (queue.active || queue.timer || !queue.waiters.size) return;
-    queue.timer = window.setTimeout(flush, CONFIG.batchDelay);
+  const scheduleKinopoiskBatch = () => {
+    const queue = state.kinopoiskQueue;
+    if (queue.active || queue.scheduled || !queue.waiters.size) return;
+    queue.scheduled = true;
+    queueMicrotask(flushKinopoiskBatch);
   };
 
-  const takeBatch = (queue) => {
-    queue.timer = null;
+  const takeKinopoiskBatch = () => {
+    const queue = state.kinopoiskQueue;
+    queue.scheduled = false;
     if (queue.active || !queue.waiters.size) return null;
     queue.active = true;
 
-    const imdbIds = [...queue.waiters.keys()].slice(0, CONFIG.batchSize);
+    const imdbIds = [...queue.waiters.keys()]
+      .slice(0, CONFIG.kinopoiskBatchSize);
     const waiters = new Map();
     imdbIds.forEach((imdbId) => {
       waiters.set(imdbId, queue.waiters.get(imdbId));
@@ -804,63 +803,23 @@
     return { imdbIds, waiters };
   };
 
-  const finishBatch = (queue, flush) => {
-    queue.active = false;
-    scheduleBatch(queue, flush);
-  };
-
   const rejectBatch = (waiters, error) => {
     waiters.forEach((subscribers) => {
       subscribers.forEach(({ reject }) => reject(error));
     });
   };
 
-  const enqueueBatch = (queue, flush, imdbId) => new Promise((resolve, reject) => {
+  const enqueueKinopoisk = (imdbId) => new Promise((resolve, reject) => {
+    const queue = state.kinopoiskQueue;
     const waiters = queue.waiters.get(imdbId) || [];
     waiters.push({ resolve, reject });
     queue.waiters.set(imdbId, waiters);
-    scheduleBatch(queue, flush);
+    scheduleKinopoiskBatch();
   });
 
-  const flushImdbBatch = async () => {
-    const queue = state.queues.imdb;
-    const batch = takeBatch(queue);
-    if (!batch) return;
-
-    try {
-      const result = await settle(fetchImdbRatings(batch.imdbIds));
-      if (result.error) {
-        rejectBatch(batch.waiters, result.error);
-        return;
-      }
-
-      batch.imdbIds.forEach((imdbId) => {
-        const entry = result.value.get(imdbId);
-        if (!entry || entry.imdbError) {
-          const error = new Error('IMDb returned an error for this title');
-          batch.waiters.get(imdbId).forEach(({ reject }) => reject(error));
-          return;
-        }
-
-        const {
-          imdbRating,
-          imdbVotes,
-          genres,
-        } = entry;
-        const data = { imdbRating, imdbVotes, genres };
-        writeSourceCache(CONFIG.cachePrefixes.imdb, imdbId, data);
-        batch.waiters.get(imdbId).forEach(({ resolve }) => resolve(data));
-      });
-    } catch (error) {
-      rejectBatch(batch.waiters, error);
-    } finally {
-      finishBatch(queue, flushImdbBatch);
-    }
-  };
-
   const flushKinopoiskBatch = async () => {
-    const queue = state.queues.kinopoisk;
-    const batch = takeBatch(queue);
+    const queue = state.kinopoiskQueue;
+    const batch = takeKinopoiskBatch();
     if (!batch) return;
 
     try {
@@ -889,18 +848,9 @@
     } catch (error) {
       rejectBatch(batch.waiters, error);
     } finally {
-      finishBatch(queue, flushKinopoiskBatch);
+      queue.active = false;
+      scheduleKinopoiskBatch();
     }
-  };
-
-  const loadImdb = (imdbId) => {
-    const cached = readSourceCache(
-      CONFIG.cachePrefixes.imdb,
-      'imdbRating',
-      imdbId,
-    );
-    if (cached) return Promise.resolve(cached);
-    return enqueueBatch(state.queues.imdb, flushImdbBatch, imdbId);
   };
 
   const loadKinopoisk = (imdbId) => {
@@ -910,7 +860,7 @@
       imdbId,
     );
     if (cached) return Promise.resolve(cached);
-    return enqueueBatch(state.queues.kinopoisk, flushKinopoiskBatch, imdbId);
+    return enqueueKinopoisk(imdbId);
   };
 
   const formatVotes = (votes) => (
@@ -1003,6 +953,103 @@
     }
   };
 
+  const beginRating = () => {
+    state.queuedRatings += 1;
+    state.pendingRatings += 1;
+    updateStatus();
+  };
+
+  const finishRating = (failed = false) => {
+    if (failed) state.failedRatings += 1;
+    state.pendingRatings -= 1;
+    updateStatus();
+    scheduleFilters();
+  };
+
+  const finishImdbSubscriber = (subscriber, movie, error = null) => {
+    let failed = Boolean(error);
+    try {
+      if (error) {
+        renderBadgeError(subscriber.badge, 'IMDb', 'Could not reach IMDb');
+      } else {
+        renderImdbResult(
+          subscriber.badge,
+          subscriber.genreElement,
+          subscriber.imdbId,
+          movie,
+        );
+      }
+    } catch (renderError) {
+      failed = true;
+      renderBadgeError(subscriber.badge, 'IMDb', 'Could not render IMDb data');
+      console.error('[Bechdel ratings]', renderError);
+    } finally {
+      finishRating(failed);
+    }
+  };
+
+  const hydrateImdbPage = async (targets) => {
+    const subscribersById = new Map();
+
+    targets.forEach(({ kpBadge, imdbId }) => {
+      const badge = getImdbBadge(kpBadge);
+      if (!badge) return;
+
+      beginRating();
+      const subscriber = {
+        badge,
+        genreElement: getGenreElement(kpBadge),
+        imdbId,
+      };
+      const cached = readSourceCache(
+        CONFIG.cachePrefixes.imdb,
+        'imdbRating',
+        imdbId,
+      );
+      if (cached) {
+        finishImdbSubscriber(subscriber, cached);
+        return;
+      }
+
+      const subscribers = subscribersById.get(imdbId) || [];
+      subscribers.push(subscriber);
+      subscribersById.set(imdbId, subscribers);
+    });
+
+    const imdbIds = [...subscribersById.keys()];
+    if (!imdbIds.length) return;
+
+    const result = await settle(fetchImdbRatings(imdbIds));
+    if (result.error) console.error('[Bechdel ratings]', result.error);
+
+    imdbIds.forEach((imdbId) => {
+      const entry = result.value?.get(imdbId);
+      const error = result.error || (
+        !entry || entry.imdbError
+          ? new Error('IMDb returned an error for this title')
+          : null
+      );
+      const subscribers = subscribersById.get(imdbId);
+      if (error) {
+        subscribers.forEach((subscriber) => {
+          finishImdbSubscriber(subscriber, null, error);
+        });
+        return;
+      }
+
+      const {
+        imdbRating,
+        imdbVotes,
+        genres,
+      } = entry;
+      const data = { imdbRating, imdbVotes, genres };
+      writeSourceCache(CONFIG.cachePrefixes.imdb, imdbId, data);
+      subscribers.forEach((subscriber) => {
+        finishImdbSubscriber(subscriber, data);
+      });
+    });
+  };
+
   const hydrateRating = async ({
     load,
     render,
@@ -1010,27 +1057,22 @@
     label,
     errorMessage,
   }) => {
-    state.queuedRatings += 1;
-    state.pendingRatings += 1;
-    updateStatus();
+    beginRating();
+    let failed = false;
     try {
       render(await load());
     } catch (error) {
+      failed = true;
       renderBadgeError(badge, label, errorMessage);
-      state.failedRatings += 1;
       console.error('[Bechdel ratings]', error);
     } finally {
-      state.pendingRatings -= 1;
-      updateStatus();
-      scheduleFilters();
+      finishRating(failed);
     }
   };
 
-  const hydrateBadges = (kpBadge, imdbId) => {
+  const hydrateKinopoiskBadge = (kpBadge, imdbId) => {
     if (kpBadge.dataset.requested === 'true') return;
     kpBadge.dataset.requested = 'true';
-    const imdbBadge = getImdbBadge(kpBadge);
-    const genreElement = getGenreElement(kpBadge);
 
     void hydrateRating({
       load: () => loadKinopoisk(imdbId),
@@ -1039,21 +1081,6 @@
       label: 'KP',
       errorMessage: 'Could not reach the Kinopoisk rating source',
     });
-
-    if (imdbBadge) {
-      void hydrateRating({
-        load: () => loadImdb(imdbId),
-        render: (movie) => renderImdbResult(
-          imdbBadge,
-          genreElement,
-          imdbId,
-          movie,
-        ),
-        badge: imdbBadge,
-        label: 'IMDb',
-        errorMessage: 'Could not reach IMDb',
-      });
-    }
   };
 
   const createRatingBadge = ({ className, label, imdbId = null }) => {
@@ -1127,17 +1154,18 @@
     const targets = collectTargets();
     addFilterPanel();
     if (!targets.length) return;
+    void hydrateImdbPage(targets);
 
     const observer = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
         if (!entry.isIntersecting) return;
         observer.unobserve(entry.target);
-        hydrateBadges(entry.target, entry.target.dataset.imdbId);
+        hydrateKinopoiskBadge(entry.target, entry.target.dataset.imdbId);
       });
     }, { rootMargin: CONFIG.observerRootMargin });
 
     targets.forEach(({ kpBadge, imdbId, immediate }) => {
-      if (immediate) hydrateBadges(kpBadge, imdbId);
+      if (immediate) hydrateKinopoiskBadge(kpBadge, imdbId);
       else observer.observe(kpBadge);
     });
   };
