@@ -34,7 +34,7 @@ new releases without manual replacement.
 | `KP ≥` | Minimum KP rating |
 | `IMDb ≥` | Minimum IMDb rating |
 | `B =` | Exact Bechdel score |
-| `Genre −` | Exclude one or more genres |
+| `Genre −` | Click genres to mark them with `×` and exclude them |
 
 Filter settings persist across pages.
 

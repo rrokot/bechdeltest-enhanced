@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.0
+// @version      1.0.1
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -199,12 +199,36 @@
         background: #fff;
         box-shadow: 2px 3px 8px rgb(0 0 0 / 18%);
       }
-      .genre-options label {
-        justify-content: flex-start;
+      .genre-option {
+        position: relative;
+        width: 100%;
+        padding: 3px 5px 3px 18px;
+        border: 0;
+        border-radius: 2px;
+        background: transparent;
+        color: #222;
+        cursor: pointer;
+        text-align: left;
         font: 11px/1.2 Arial, sans-serif;
       }
-      .genre-options input {
-        margin: 0 3px 0 0;
+      .genre-option::before {
+        content: "×";
+        position: absolute;
+        left: 5px;
+        color: #a11;
+        font-weight: bold;
+        opacity: 0;
+      }
+      .genre-option:hover {
+        background: #eee;
+      }
+      .genre-option[data-excluded="true"] {
+        background: #ffe3e3;
+        color: #811;
+        text-decoration: line-through;
+      }
+      .genre-option[data-excluded="true"]::before {
+        opacity: 1;
       }
     `;
     document.head.append(style);
@@ -248,6 +272,13 @@
       : 'Genre −';
   };
 
+  const updateGenreOptionState = (button, genre) => {
+    const excluded = state.filters.excludedGenres.has(genre);
+    button.dataset.excluded = String(excluded);
+    button.setAttribute('aria-pressed', String(excluded));
+    button.title = excluded ? `Include ${genre}` : `Exclude ${genre}`;
+  };
+
   const updateGenreFilterOptions = (genres = []) => {
     if (!state.filters?.genreOptions) return;
     let changed = false;
@@ -262,18 +293,22 @@
     [...state.filters.knownGenres]
       .sort((a, b) => a.localeCompare(b))
       .forEach((genre) => {
-        const label = document.createElement('label');
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = state.filters.excludedGenres.has(genre);
-        checkbox.addEventListener('change', () => {
-          if (checkbox.checked) state.filters.excludedGenres.add(genre);
-          else state.filters.excludedGenres.delete(genre);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'genre-option';
+        button.textContent = genre;
+        updateGenreOptionState(button, genre);
+        button.addEventListener('click', () => {
+          if (state.filters.excludedGenres.has(genre)) {
+            state.filters.excludedGenres.delete(genre);
+          } else {
+            state.filters.excludedGenres.add(genre);
+          }
+          updateGenreOptionState(button, genre);
           updateGenreSummary();
           applyFilters();
         });
-        label.append(checkbox, document.createTextNode(genre));
-        fragment.append(label);
+        fragment.append(button);
       });
     state.filters.genreOptions.replaceChildren(fragment);
     updateGenreSummary();
