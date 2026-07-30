@@ -19,10 +19,11 @@ A lightweight Tampermonkey userscript that adds ratings, genres, and filters to
 ## Installation
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).
-2. Open the
+2. Open the Tampermonkey extension settings and enable **Allow User Scripts**.
+3. Open the
    [userscript installer](https://raw.githubusercontent.com/rrokot/bechdeltest-enhanced/main/bechdeltest-enhanced.user.js).
-3. Confirm the installation in Tampermonkey.
-4. Open [bechdeltest.com](https://bechdeltest.com/).
+4. Confirm the installation in Tampermonkey.
+5. Open [bechdeltest.com](https://bechdeltest.com/).
 
 Tampermonkey checks the `@updateURL` automatically, so installed copies receive
 new releases without manual replacement.
