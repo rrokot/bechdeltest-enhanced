@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bechdel Test — Ratings & Filters
 // @namespace    https://github.com/rrokot/bechdeltest-enhanced
-// @version      1.0.2
+// @version      1.0.3
 // @description  Adds ratings, genres, and filters without an API key.
 // @author       rrokot
 // @license      MIT
@@ -27,6 +27,13 @@
   'use strict';
 
   const CONFIG = Object.freeze({
+    urls: Object.freeze({
+      wikidataSparql: 'https://query.wikidata.org/sparql',
+      imdbGraphql: 'https://api.graphql.imdb.com/',
+      kinopoiskRating: 'https://rating.kinopoisk.ru',
+      kinopoiskTitle: 'https://www.kinopoisk.ru/film',
+      imdbTitle: 'https://www.imdb.com/title',
+    }),
     cachePrefix: 'movie-ratings:no-key:v2:',
     filterKey: 'movie-ratings:filters:v1',
     cacheTtl: 7 * 24 * 60 * 60 * 1000,
@@ -34,6 +41,18 @@
     batchSize: 10,
     batchDelay: 80,
     maxActiveMovies: 10,
+    requestTimeout: 20_000,
+    genreLimit: 3,
+    observerRootMargin: '150px 0px',
+    ratingPrecision: 1,
+    numberLocale: 'en-US',
+    ratingTiers: Object.freeze([
+      Object.freeze({ minimum: 8, name: 'excellent' }),
+      Object.freeze({ minimum: 7, name: 'good' }),
+      Object.freeze({ minimum: 6, name: 'average' }),
+      Object.freeze({ minimum: 5, name: 'weak' }),
+      Object.freeze({ minimum: 0, name: 'bad' }),
+    ]),
   });
 
   const SELECTORS = Object.freeze({
@@ -498,7 +517,7 @@
       url,
       headers,
       data,
-      timeout: 20000,
+      timeout: CONFIG.requestTimeout,
       onload: (response) => {
         if (response.status >= 200 && response.status < 300) {
           resolve(response.responseText);
@@ -535,7 +554,7 @@
       format: 'json',
     });
     const text = await gmRequest({
-      url: `https://query.wikidata.org/sparql?${params}`,
+      url: `${CONFIG.urls.wikidataSparql}?${params}`,
       headers: {
         Accept: 'application/sparql-results+json',
       },
@@ -563,7 +582,7 @@
     });
     const text = await gmRequest({
       method: 'POST',
-      url: 'https://api.graphql.imdb.com/',
+      url: CONFIG.urls.imdbGraphql,
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
@@ -583,7 +602,10 @@
           ? rating.voteCount
           : null,
         genres: Array.isArray(genres)
-          ? genres.map((genre) => genre.text).filter(Boolean).slice(0, 3)
+          ? genres
+            .map((genre) => genre.text)
+            .filter(Boolean)
+            .slice(0, CONFIG.genreLimit)
           : [],
       }];
     }));
@@ -591,7 +613,7 @@
 
   const fetchKinopoiskRating = async (kinopoiskId) => {
     const xmlText = await gmRequest({
-      url: `https://rating.kinopoisk.ru/${kinopoiskId}.xml`,
+      url: `${CONFIG.urls.kinopoiskRating}/${kinopoiskId}.xml`,
       headers: {
         Accept: 'application/xml,text/xml',
       },
@@ -674,16 +696,12 @@
   };
 
   const formatVotes = (votes) => (
-    votes ? new Intl.NumberFormat('en-US').format(votes) : ''
+    votes ? new Intl.NumberFormat(CONFIG.numberLocale).format(votes) : ''
   );
 
-  const getRatingTier = (rating) => {
-    if (rating >= 8) return 'excellent';
-    if (rating >= 7) return 'good';
-    if (rating >= 6) return 'average';
-    if (rating >= 5) return 'weak';
-    return 'bad';
-  };
+  const getRatingTier = (rating) => (
+    CONFIG.ratingTiers.find(({ minimum }) => rating >= minimum).name
+  );
 
   const getImdbBadge = (kpBadge) => {
     const sibling = kpBadge.nextElementSibling;
@@ -710,12 +728,13 @@
     } else {
       badge.dataset.state = 'ready';
       badge.dataset.tier = getRatingTier(rating);
-      badge.textContent = rating.toFixed(1);
+      const formattedRating = rating.toFixed(CONFIG.ratingPrecision);
+      badge.textContent = formattedRating;
       badge.title = [
-        `${label} rating: ${rating.toFixed(1)}`,
+        `${label} rating: ${formattedRating}`,
         votes ? `Votes: ${formatVotes(votes)}` : '',
       ].filter(Boolean).join('\n');
-      badge.setAttribute('aria-label', `${label} rating: ${rating.toFixed(1)}`);
+      badge.setAttribute('aria-label', `${label} rating: ${formattedRating}`);
     }
 
     if (href) {
@@ -736,7 +755,7 @@
       rating: movie.kpRating,
       votes: movie.kpVotes,
       href: movie.kinopoiskId
-        ? `https://www.kinopoisk.ru/film/${movie.kinopoiskId}/`
+        ? `${CONFIG.urls.kinopoiskTitle}/${movie.kinopoiskId}/`
         : null,
       missingMessage: 'Wikidata has no Kinopoisk ID for this IMDb title',
     });
@@ -747,7 +766,7 @@
         label: 'IMDb',
         rating: movie.imdbRating,
         votes: movie.imdbVotes,
-        href: `https://www.imdb.com/title/${imdbId}/`,
+        href: `${CONFIG.urls.imdbTitle}/${imdbId}/`,
         missingMessage: 'This title has no IMDb rating yet',
       });
     }
@@ -883,7 +902,7 @@
         observer.unobserve(entry.target);
         hydrateBadges(entry.target, entry.target.dataset.imdbId);
       });
-    }, { rootMargin: '150px 0px' });
+    }, { rootMargin: CONFIG.observerRootMargin });
 
     targets.forEach(({ kpBadge, imdbId, immediate }) => {
       if (immediate) hydrateBadges(kpBadge, imdbId);
